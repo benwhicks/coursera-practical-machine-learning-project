@@ -1,0 +1,119 @@
+---
+title: "Practical Machine Learning Course Project"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+library(tidyverse)
+library(tidymodels)
+```
+
+``` {r importing}
+training <- read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+testing <- read_csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+# training <- read_csv("training.csv") 
+# testing <- read_csv("testing.csv")
+
+training$classe <- factor(training$classe, 
+                          levels = c("A", "B", "C", "D", "E"))
+```
+
+## Outline
+
+The Human Activity Recognition (HAR) dataset includes a set of detailed measurements of participants performing weight lifting. This Weight Lifting Exercises dataset recorded movements of six participants. The *classe* variable indicates how the participant was trying to perform the exercise, and will be the target of the analysis. A value of *A* for *classe* indicates perfect form and *B* through to *E* are ways of performing the exercise with a common mistake. 
+
+# Analysis
+
+## Preprocessing
+
+First, the data needed to be processed to make it useful for a machine learning model. The following recipe was used and prepped on the training data set:
+
+``` {r recipe}
+td_rec <- training %>%
+  recipe() %>% 
+  update_role(classe, new_role = "outcome") %>% 
+  update_role(contains("arm"), new_role = "predictor") %>%
+  update_role(contains("belt"), new_role = "predictor") %>%
+  update_role(contains("bell"), new_role = "predictor") %>%
+  step_rm(-has_role("outcome"), -has_role("predictor")) %>% 
+  step_mutate_at(all_predictors(), fn = ~as.numeric(.)) %>%
+  step_center(all_numeric()) %>% 
+  step_scale(all_numeric()) %>% 
+  step_medianimpute(all_predictors()) %>% 
+  # step_mutate_at(all_predictors(),
+  #                fn = ~if_else(is.nan(.), 0 , .)) %>% 
+  step_nzv(all_predictors())
+
+td_pre <- td_rec %>% 
+  prep(data = training)
+
+td_pre
+```
+
+There are a few choices in the pre-processing stage here that are worth explaining:
+
+1. Only including arm, belt, dumbell variables for prediction; the other variables such as X1 and user_name did not relate to the problem of mapping movement data to the *classe* variable.
+2. Forcing some predictors into numeric form; a few "DIV/0" style text entries coerced data into character form and this was forcing that data into numeric form and the odd entries to NA's.
+3. Imputing missing data using a median; this could have easily been the mean but I felt the median would be a better fit here, particularly if movements of the participants have been exaggerated to perform the incorrect movements and this would unduly affect the mean, but the median would be a more robust measure of the centre. 
+4. Removing data with little value; some of the data was returning many NA's and NaN's due to lack of information so was removed from the training data set.
+
+## Model Training
+
+The preprocessed data was then used to train a random forest model.
+
+``` {r training}
+training_data_baked <- td_pre %>% 
+  bake(new_data = training) 
+
+rf.mdl <- rand_forest(trees = 200, mode = "classification") %>% 
+  set_engine("randomForest") %>% 
+  fit(classe ~ ., data = training_data_baked)
+
+rf.mdl$fit$confusion %>% 
+  as_tibble() %>% 
+  knitr::kable(caption = "Confusion Matrix") 
+```
+
+## Cross Validation
+
+We use a 15-fold cross-validation of the training data, and check the accuracy of each subset of the training data on the out-of-sample data (but still within the training set)
+
+``` {r cv}
+vd_baked <- training_data_baked %>% 
+  rsample::mc_cv(prop = 0.75, times = 15)
+
+validate <- function(split, id) {
+  analysis_set <- analysis(split)
+  assessment_set <- assessment(split)
+  model <- rand_forest(trees = 200, mode = "classification") %>% 
+    set_engine("randomForest") %>% 
+    fit(classe ~ ., data = analysis_set)
+  tib <- tibble("id" = id,
+                "truth" = assessment_set$classe,
+                "estimate" = unlist(predict(model, new_data = assessment_set)))
+  return(tib %>% 
+           mutate(correct = truth == estimate))
+}
+
+# TODO: Would be nice to use :
+#   predict(model, new_data, type = "prob") to generate the probabilities
+#   and then get roc_curves useing
+#   cv %>% roc_curve(truth, spec) %>% autoplot()
+#   But spec would need to be calculated from the probabilities
+
+cv <- map2_df(.x = vd_baked$splits,
+              .y = vd_baked$id,
+              ~validate(split = .x, id = .y))
+
+cv_summary <- cv %>% 
+  group_by(id) %>% 
+  summarise(accuracy = mean(correct)) 
+
+```
+
+From this we would expect an out of sample error rate of around `r round(1 - mean(cv_summary$accuracy), 4)`. This broadly agrees with the model summary when trained on the entire training set (see the OOB estimate of error rate)
+
+``` {r}
+rf.mdl
+```
